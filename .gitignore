@@ -1,4 +1,8 @@
 pkg/
 api.key
-.api.key.trimmed
 *-handin.tar.gz
+.swp
+mr-out-*
+mr-tmp/
+test
+log
