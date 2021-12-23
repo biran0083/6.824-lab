@@ -1,0 +1,9 @@
+invariants:
+- last_applied_index <= commited_index for all servers
+- snapshot index <= commited_index
+- nextIndex[i] >= snapshot index
+- snapshot index never decreases
+
+false invariants
+- commited_index >= quorum in match_index:
+    new leader initialize match_index to 0 without changing commited_index

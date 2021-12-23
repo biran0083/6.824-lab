@@ -1,12 +1,16 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 const Debug = false
@@ -18,11 +22,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	OpType    string
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int64
 }
 
 type KVServer struct {
@@ -34,16 +39,75 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	data                 map[string]string
+	resultChan           map[int]chan int
+	lastAppliedIndex     int
+	lastAppliedTerm      int
+	lastAppliedRequestId map[int64]int64
 }
 
+func (kv *KVServer) ReadMyWrite() bool {
+	for {
+		kv.mu.Lock()
+		index, term, isLeader := kv.rf.Start(Op{"HeartBeat", "", "", 0, 0})
+		if !isLeader {
+			kv.mu.Unlock()
+			return false
+		}
+		if ch, ok := kv.resultChan[index]; ok {
+			ch <- 0
+		}
+		res := make(chan int)
+		kv.resultChan[index] = res
+		kv.mu.Unlock()
+		resultTerm := <-res
+		if resultTerm == term {
+			return true
+		}
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	//DPrintf("[%d] begin read my write", kv.me)
+	if !kv.ReadMyWrite() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	//DPrintf("[%d] end read my write", kv.me)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	reply.Err = OK
+	if value, ok := kv.data[args.Key]; !ok {
+		reply.Value = ""
+	} else {
+		reply.Value = value
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	res := make(chan int)
+	kv.mu.Lock()
+	index, term, isLeader := kv.rf.Start(Op{args.Op, args.Key, args.Value, args.ClientId, args.RequestId})
+	if isLeader {
+		if ch, ok := kv.resultChan[index]; ok {
+			ch <- 0
+		}
+		kv.resultChan[index] = res
+	}
+	kv.mu.Unlock()
+	if isLeader {
+		resultTerm := <-res
+		kv.mu.Lock()
+		delete(kv.resultChan, index)
+		kv.mu.Unlock()
+		if resultTerm != term {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Err = OK
+		}
+	} else {
+		reply.Err = ErrWrongLeader
+	}
 }
 
 //
@@ -65,6 +129,164 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) applyOp(msg raft.ApplyMsg) {
+
+	op, ok := msg.Command.(Op)
+	if !ok {
+		panic("failed to cast command to Op")
+	}
+	DPrintf("[%d] applying %v", kv.me, op)
+
+	kv.mu.Lock()
+	if msg.CommandIndex != kv.lastAppliedIndex+1 {
+		panic(fmt.Sprintf("CommandIndex=%d, lastAppliedIndex=%d", msg.CommandIndex, kv.lastAppliedIndex))
+	}
+	kv.lastAppliedIndex++
+	if msg.CommandTerm < kv.lastAppliedTerm {
+		panic("term decreases")
+	}
+	kv.lastAppliedTerm = msg.CommandTerm
+	switch {
+	case op.OpType == "Put":
+		reqId := kv.lastAppliedRequestId[op.ClientId]
+		if reqId < op.RequestId {
+			kv.data[op.Key] = op.Value
+			kv.lastAppliedRequestId[op.ClientId] = op.RequestId
+		} else if reqId == op.RequestId {
+			DPrintf("duplicate request detected")
+		} else {
+			panic("ignore old request")
+		}
+	case op.OpType == "Append":
+		reqId := kv.lastAppliedRequestId[op.ClientId]
+		if reqId < op.RequestId {
+			value, ok := kv.data[op.Key]
+			if ok {
+				kv.data[op.Key] = value + op.Value
+			} else {
+				kv.data[op.Key] = op.Value
+			}
+			kv.lastAppliedRequestId[op.ClientId] = op.RequestId
+		} else if reqId == op.RequestId {
+			DPrintf("duplicate request detected")
+		} else {
+			panic("old request")
+		}
+	case op.OpType == "HeartBeat":
+	default:
+		panic("unknown op type")
+	}
+	ch, chFound := kv.resultChan[msg.CommandIndex]
+	kv.mu.Unlock()
+
+	if chFound {
+		ch <- msg.CommandTerm
+	}
+}
+
+func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	if !msg.SnapshotValid {
+		panic("Snapshot invalid")
+	}
+	raw := msg.Snapshot
+	index := msg.SnapshotIndex
+	term := msg.SnapshotTerm
+	kv.mu.Lock()
+	if kv.rf.CondInstallSnapshot(term, index, raw) {
+		kv.loadSnapshotData(raw)
+	}
+	DPrintf("[%d] snapshot applied", kv.me)
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) runApplyLoop() {
+	for {
+		if kv.killed() {
+			break
+		}
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.applyOp(msg)
+			} else {
+				kv.applySnapshot(msg)
+			}
+		case <-time.After(time.Millisecond * 100):
+			term, isLeader := kv.rf.GetState()
+			kv.mu.Lock()
+			if isLeader && kv.lastAppliedTerm != term {
+				kv.rf.Start(Op{"HeartBeat", "", "", 0, 0})
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *KVServer) runSnapshotter(persister *raft.Persister) {
+	for {
+		if kv.killed() {
+			break
+		}
+		select {
+		case <-time.After(time.Millisecond * 100):
+			stateSize := persister.RaftStateSize()
+			if kv.maxraftstate != -1 && stateSize > kv.maxraftstate {
+				//DPrintf("saving snapshot. state_size=%d", stateSize)
+				kv.saveSnapshot()
+			}
+		}
+	}
+}
+
+func (kv *KVServer) saveSnapshot() {
+	kv.mu.Lock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.lastAppliedIndex)
+	e.Encode(kv.lastAppliedTerm)
+	e.Encode(kv.lastAppliedRequestId)
+	DPrintf("[%d] saving snapshot data %v", kv.me, kv.data)
+	DPrintf("[%d] saving snapshot last applied request id %v", kv.me, kv.lastAppliedRequestId)
+	data := w.Bytes()
+	kv.rf.Snapshot(kv.lastAppliedIndex, data)
+	kv.mu.Unlock()
+}
+
+// called with kv.mu locked
+func (kv *KVServer) loadSnapshotData(raw []byte) {
+	r := bytes.NewBuffer(raw)
+	d := labgob.NewDecoder(r)
+	var data map[string]string
+	var lastAppliedIndex int
+	var lastAppliedTerm int
+	var lastAppliedRequestId map[int64]int64
+	if d.Decode(&data) != nil ||
+		d.Decode(&lastAppliedIndex) != nil ||
+		d.Decode(&lastAppliedTerm) != nil ||
+		d.Decode(&lastAppliedRequestId) != nil {
+		log.Fatal("failed to decode state")
+	} else {
+		kv.data = data
+		kv.lastAppliedIndex = lastAppliedIndex
+		kv.lastAppliedTerm = lastAppliedTerm
+		kv.lastAppliedRequestId = lastAppliedRequestId
+		DPrintf("[%d] load snapshot data %v", kv.me, kv.data)
+		DPrintf("[%d] lastAppliedRequestId %v", kv.me, kv.lastAppliedRequestId)
+	}
+}
+
+func (kv *KVServer) loadSnapshot(persister *raft.Persister) {
+	raw := persister.ReadSnapshot()
+	if raw == nil || len(raw) < 1 { // bootstrap without any state?
+		return
+	}
+	kv.mu.Lock()
+	kv.loadSnapshotData(raw)
+	kv.mu.Unlock()
 }
 
 //
@@ -89,13 +311,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.resultChan = make(map[int]chan int)
+	kv.lastAppliedRequestId = map[int64]int64{}
+	kv.loadSnapshot(persister)
+	go kv.runApplyLoop()
+	go kv.runSnapshotter(persister)
 
 	return kv
 }

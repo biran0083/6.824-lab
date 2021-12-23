@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -1051,13 +1053,17 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// reconnect a follower, who maybe behind and
 			// needs to rceive a snapshot to catch up.
 			cfg.connect(victim)
+			cfg.rafts[victim].DLog("slow consensus start")
 			cfg.one(rand.Int(), servers, true)
+			cfg.rafts[victim].DLog("slow consensus finish")
 			leader1 = cfg.checkOneLeader()
 		}
 		if crash {
 			cfg.start1(victim, cfg.applierSnap)
 			cfg.connect(victim)
+			cfg.rafts[victim].DLog("slow consensus start")
 			cfg.one(rand.Int(), servers, true)
+			cfg.rafts[victim].DLog("slow consensus finish")
 			leader1 = cfg.checkOneLeader()
 		}
 	}

@@ -1,16 +1,19 @@
 package kvraft
 
-import "6.824/porcupine"
-import "6.824/models"
-import "testing"
-import "strconv"
-import "time"
-import "math/rand"
-import "strings"
-import "sync"
-import "sync/atomic"
-import "fmt"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"6.824/models"
+	"6.824/porcupine"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -250,6 +253,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		// log.Printf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
+		var failed int32 = 0
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
 			j := 0
 			defer func() {
@@ -284,7 +288,9 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 					v := Get(cfg, myck, key, opLog, cli)
 					// the following check only makes sense when we're not using random keys
 					if !randomkeys && v != last {
-						t.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
+						DPrintf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
+						atomic.AddInt32(&failed, 1)
+						return
 					}
 				}
 			}
@@ -332,12 +338,16 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		for i := 0; i < nclients; i++ {
 			// log.Printf("read from clients %d\n", i)
 			j := <-clnts[i]
+			if atomic.LoadInt32(&failed) > 0 {
+				t.Fail()
+			}
 			// if j < 10 {
-			// 	log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
+			// log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
 			// }
 			key := strconv.Itoa(i)
 			// log.Printf("Check %v for client %d\n", j, i)
 			v := Get(cfg, ck, key, opLog, 0)
+			//DPrintf("key='%s' value='%s'\n", key, v)
 			if !randomkeys {
 				checkClntAppends(t, i, v, j)
 			}
