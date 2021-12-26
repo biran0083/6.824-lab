@@ -7,3 +7,4 @@ invariants:
 false invariants
 - commited_index >= quorum in match_index:
     new leader initialize match_index to 0 without changing commited_index
+    

@@ -103,6 +103,9 @@ type Raft struct {
 	electionTs       time.Time
 	snapshot         SnapshotData
 	leaderId         int
+
+	reprMu sync.Mutex
+	repr   string
 }
 
 // return currentTerm and whether this server
@@ -132,6 +135,9 @@ func (rf *Raft) persist(snapshot []byte) {
 	} else {
 		rf.persister.SaveRaftState(data)
 	}
+	rf.reprMu.Lock()
+	rf.repr = rf.String()
+	rf.reprMu.Unlock()
 }
 
 //
@@ -305,12 +311,9 @@ func (rf *Raft) DLog(format string, args ...interface{}) {
 		s += "\n"
 	}
 	prefix := fmt.Sprintf("%v", time.Now().Format("15:04:05.00000"))
-	go func() {
-		if rf.isStopping() || rf.killed() {
-			return
-		}
-		DPrintf("%v %v %v", prefix, rf, s)
-	}()
+	rf.reprMu.Lock()
+	DPrintf("%s %s %s", prefix, rf.repr, s)
+	rf.reprMu.Unlock()
 }
 
 //
@@ -715,10 +718,7 @@ func (rf *Raft) UpdateCommitIndex() bool {
 }
 
 func (rf *Raft) RunSnapshotter() {
-	for {
-		if rf.isStopping() {
-			break
-		}
+	for !rf.isStopping() {
 		rf.mu.Lock()
 		if rf.state == LEADER {
 			for i, peer := range rf.peers {
@@ -747,15 +747,14 @@ func (rf *Raft) RunSnapshotter() {
 }
 
 func (rf *Raft) RunAppender(i int) {
-	for {
-		if rf.isStopping() {
-			break
-		}
+Loop:
+	for !rf.isStopping() {
 		var shouldAppend bool
 		rf.mu.Lock()
 		for {
 			if rf.isStopping() {
-				break
+				rf.mu.Unlock()
+				break Loop
 			}
 			shouldAppend = rf.state == LEADER && rf.nextIndex[i] < rf.nextLogIndex() && rf.nextIndex[i] > rf.snapshot.snapshotIndex
 
@@ -764,10 +763,6 @@ func (rf *Raft) RunAppender(i int) {
 			} else {
 				rf.appenderCv.Wait()
 			}
-		}
-		if rf.isStopping() {
-			rf.mu.Unlock()
-			break
 		}
 		req := AppendEntriesRequest{}
 		index := rf.nextIndex[i]
@@ -799,11 +794,13 @@ func (rf *Raft) RunAppender(i int) {
 }
 
 func (rf *Raft) RunAplier() {
+Loop:
 	for {
 		rf.mu.Lock()
 		for {
 			if rf.isStopping() {
-				break
+				rf.mu.Unlock()
+				break Loop
 			}
 			if rf.lastApplied < rf.snapshot.snapshotIndex {
 				panic(fmt.Sprintf("last appied id %d < snapshot id %d", rf.lastApplied, rf.snapshot.snapshotIndex))
@@ -813,10 +810,6 @@ func (rf *Raft) RunAplier() {
 			} else {
 				rf.applierCv.Wait()
 			}
-		}
-		if rf.isStopping() {
-			rf.mu.Unlock()
-			break
 		}
 		msgs := []ApplyMsg{}
 		for rf.lastApplied < rf.commitedIndex {
@@ -845,7 +838,7 @@ func (rf *Raft) UpdateElectionTs() {
 
 func (rf *Raft) RunElectionSchedulingLoop() {
 	rf.UpdateElectionTs()
-	for {
+	for !rf.isStopping() {
 		rf.mu.Lock()
 		if rf.isStopping() {
 			rf.mu.Unlock()
@@ -870,10 +863,7 @@ func (rf *Raft) RunElectionSchedulingLoop() {
 }
 
 func (rf *Raft) RunHeartBeatLoop() {
-	for {
-		if rf.isStopping() {
-			break
-		}
+	for !rf.isStopping() {
 		select {
 		case <-time.After(time.Millisecond * 100):
 			rf.mu.Lock()
@@ -887,12 +877,12 @@ func (rf *Raft) RunHeartBeatLoop() {
 	rf.bgLoopShutdownCh <- 0
 }
 
+// called with rf.mu locked
 func (rf *Raft) String() string {
 	var state string
 	var log string
 	var index int
 	var term int
-	rf.mu.Lock()
 	index = rf.me
 	term = rf.currentTerm
 	if rf.state == LEADER {
@@ -940,7 +930,6 @@ func (rf *Raft) String() string {
 			}
 		}
 	}
-	rf.mu.Unlock()
 	return fmt.Sprintf("%p %s%d(%d)[%s]", rf, state, index, term, log)
 }
 
