@@ -54,7 +54,9 @@ func (kv *KVServer) ReadMyWrite() bool {
 			kv.mu.Unlock()
 			return false
 		}
+		DPrintf("[%d] starting heart beat, index=%d", kv.me, index)
 		if ch, ok := kv.resultChan[index]; ok {
+			DPrintf("[%d] send invalid term to result chan waiting at index=%d", kv.me, index)
 			ch <- 0
 		}
 		res := make(chan int)
@@ -62,13 +64,15 @@ func (kv *KVServer) ReadMyWrite() bool {
 		kv.mu.Unlock()
 		resultTerm := <-res
 		if resultTerm == term {
+			DPrintf("[%d] heart beat term matches", kv.me)
 			return true
+		} else {
+			DPrintf("[%d] heart beat term mismatches", kv.me)
 		}
 	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	//DPrintf("[%d] begin read my write", kv.me)
 	if !kv.ReadMyWrite() {
 		reply.Err = ErrWrongLeader
 		return
@@ -132,16 +136,17 @@ func (kv *KVServer) killed() bool {
 }
 
 func (kv *KVServer) applyOp(msg raft.ApplyMsg) {
-
 	op, ok := msg.Command.(Op)
 	if !ok {
 		panic("failed to cast command to Op")
 	}
-	DPrintf("[%d] applying %v", kv.me, op)
 
-	kv.mu.Lock()
-	if msg.CommandIndex != kv.lastAppliedIndex+1 {
-		panic(fmt.Sprintf("CommandIndex=%d, lastAppliedIndex=%d", msg.CommandIndex, kv.lastAppliedIndex))
+	if msg.CommandIndex > kv.lastAppliedIndex+1 {
+		panic(fmt.Sprintf("apply message out of order CommandIndex=%d, lastAppliedIndex=%d", msg.CommandIndex, kv.lastAppliedIndex))
+	} else if msg.CommandIndex <= kv.lastAppliedIndex {
+		// can happen if snapshot is installed betwee rf unlock and op being sent to apply channel
+		DPrintf("skip old op")
+		return
 	}
 	kv.lastAppliedIndex++
 	if msg.CommandTerm < kv.lastAppliedTerm {
@@ -178,12 +183,10 @@ func (kv *KVServer) applyOp(msg raft.ApplyMsg) {
 	default:
 		panic("unknown op type")
 	}
-	ch, chFound := kv.resultChan[msg.CommandIndex]
-	kv.mu.Unlock()
-
-	if chFound {
+	if ch, chFound := kv.resultChan[msg.CommandIndex]; chFound {
 		ch <- msg.CommandTerm
 	}
+
 }
 
 func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
@@ -193,12 +196,10 @@ func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
 	raw := msg.Snapshot
 	index := msg.SnapshotIndex
 	term := msg.SnapshotTerm
-	kv.mu.Lock()
 	if kv.rf.CondInstallSnapshot(term, index, raw) {
 		kv.loadSnapshotData(raw)
 	}
 	DPrintf("[%d] snapshot applied", kv.me)
-	kv.mu.Unlock()
 }
 
 func (kv *KVServer) runApplyLoop() {
@@ -208,11 +209,14 @@ func (kv *KVServer) runApplyLoop() {
 		}
 		select {
 		case msg := <-kv.applyCh:
+			kv.mu.Lock()
+			DPrintf("[%d] applying %v", kv.me, msg)
 			if msg.CommandValid {
 				kv.applyOp(msg)
 			} else {
 				kv.applySnapshot(msg)
 			}
+			kv.mu.Unlock()
 		case <-time.After(time.Millisecond * 100):
 			term, isLeader := kv.rf.GetState()
 			kv.mu.Lock()

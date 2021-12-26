@@ -709,7 +709,8 @@ func (rf *Raft) UpdateCommitIndex() bool {
 	a[rf.me] = rf.nextLogIndex() - 1
 	sort.Ints(a)
 	quorumReplicatedIndex := a[(len(a)-1)/2]
-	if rf.getEntryTerm(quorumReplicatedIndex) == rf.currentTerm &&
+	if quorumReplicatedIndex >= rf.snapshot.snapshotIndex &&
+		rf.getEntryTerm(quorumReplicatedIndex) == rf.currentTerm &&
 		quorumReplicatedIndex > rf.commitedIndex {
 		rf.commitedIndex = quorumReplicatedIndex
 		return true

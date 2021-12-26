@@ -14,7 +14,7 @@ type ShardCtrler struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
-	// Your data here.
+	resultChan map[int]chan int
 
 	configs []Config // indexed by config num
 }
@@ -24,14 +24,17 @@ type Op struct {
 	NewConfig Config
 }
 
+func rebalance(config *Config) {}
+
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	sc.mu.Lock()
-	sc.mu.Unlock()
+	defer sc.mu.Unlock()
 	config := sc.configs[len(sc.configs)-1]
 	config.Num++
 	for gid, servers := range args.Servers {
 		config.Groups[gid] = servers
 	}
+	rebalance(&config)
 	_, _, isLeader := sc.rf.Start(Op{Name: "Join", NewConfig: config})
 	if !isLeader {
 		reply.WrongLeader = true
@@ -45,6 +48,27 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+}
+
+func (sc *ShardCtrler) ReadMyWrite() bool {
+	for {
+		sc.mu.Lock()
+		index, term, isLeader := sc.rf.Start(Op{Name: "HeartBeat"})
+		if !isLeader {
+			sc.mu.Unlock()
+			return false
+		}
+		if ch, ok := sc.resultChan[index]; ok {
+			ch <- 0
+		}
+		res := make(chan int)
+		sc.resultChan[index] = res
+		sc.mu.Unlock()
+		resultTerm := <-res
+		if resultTerm == term {
+			return true
+		}
+	}
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
@@ -92,6 +116,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	sc.configs = make([]Config, 1)
 	sc.configs[0].Groups = map[int][]string{}
+	sc.resultChan = map[int]chan int{}
 
 	labgob.Register(Op{})
 	sc.applyCh = make(chan raft.ApplyMsg)
