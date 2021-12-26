@@ -29,7 +29,9 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK                 = "OK"
+	WRONG_LEADER       = "WRONG_LEADER"
+	COMMIT_OVERWRITTEN = "COMMIT_OVERWRITTEN"
 )
 
 type Err string
