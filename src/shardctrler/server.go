@@ -1,11 +1,12 @@
 package shardctrler
 
+import (
+	"sync"
 
-import "6.824/raft"
-import "6.824/labrpc"
-import "sync"
-import "6.824/labgob"
-
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
+)
 
 type ShardCtrler struct {
 	mu      sync.Mutex
@@ -18,14 +19,24 @@ type ShardCtrler struct {
 	configs []Config // indexed by config num
 }
 
-
 type Op struct {
-	// Your data here.
+	Name      string
+	NewConfig Config
 }
 
-
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	// Your code here.
+	sc.mu.Lock()
+	sc.mu.Unlock()
+	config := sc.configs[len(sc.configs)-1]
+	config.Num++
+	for gid, servers := range args.Servers {
+		config.Groups[gid] = servers
+	}
+	_, _, isLeader := sc.rf.Start(Op{Name: "Join", NewConfig: config})
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -37,9 +48,21 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	_, _, isLeader := sc.rf.Start(Op{Name: "HeartBeat"})
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	if args.Num == -1 {
+		reply.Config = sc.configs[len(sc.configs)-1]
+	} else if args.Num >= len(sc.configs) || args.Num < -1 {
+		reply.Err = "config index out of bound"
+	} else {
+		reply.Config = sc.configs[args.Num]
+	}
 }
-
 
 //
 // the tester calls Kill() when a ShardCtrler instance won't
